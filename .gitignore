@@ -1,0 +1,9 @@
+.env
+vectorstore/
+chromadb/
+__pycache__/
+.env
+venv/
+node_modules/
+uploads/
+*.pyc
