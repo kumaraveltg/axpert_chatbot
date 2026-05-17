@@ -1,10 +1,9 @@
 import psycopg2
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv 
 
 load_dotenv()
-
-
+ 
 def get_conn(schema: str):
     """Connect using meta schema (schema + axdef)"""
     meta_schema = schema + "axdef"
@@ -189,3 +188,4 @@ def detect_practice_chains(schema: str, transids: list) -> list:
             visited.add(transid)
 
     return chains
+ 

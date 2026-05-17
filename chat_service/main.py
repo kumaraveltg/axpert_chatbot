@@ -4,7 +4,7 @@ chat_service/main.py
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel 
 from typing import Optional
 import os
 from groq import Groq
@@ -12,6 +12,14 @@ from dotenv import load_dotenv
 
 from sync_service.chromadb_store import query_combined
 from shared.chroma_config import get_chroma
+from fastapi import WebSocket, WebSocketDisconnect
+from chat_service.ws_manager import ws_manager
+from chat_service.ws_events import WSEvent
+from chat_service.intent_classifier import classify_intent
+from chat_service.report_agent import handle_report
+from sync_service.change_detector import start_detector
+import uuid
+import asyncio ,json
 
 load_dotenv()
 
@@ -35,6 +43,10 @@ groq_client = Groq(
 )
 
 
+@app.on_event("startup")
+async def startup():
+    await start_background_services()
+    
 # ── Threshold ─────────────────────────────────────────────────
 
 def get_threshold(distances: list) -> float:
@@ -48,6 +60,61 @@ def get_threshold(distances: list) -> float:
         return 0.0
     return best * 1.2
 
+
+async def start_background_services():
+    from shared.database import get_db
+    from shared.models import CustomerConnection
+    db      = next(get_db())
+    schemas = [c.schema_name for c in db.query(CustomerConnection).all()]
+    if schemas:
+        ws_manager.start_redis_listener(schemas)
+        start_detector(schemas)
+        print(f"[startup] Monitoring: {schemas}")
+
+
+# ── 3. WebSocket endpoint ─────────────────────────────────────
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(ws: WebSocket, client_id: str):
+    """
+    client_id = "{schema}_{uuid}"  e.g. "hcaspay_abc123"
+    Frontend: new WebSocket(`wss://domain/api/chat/ws/hcaspay_abc123`)
+    """
+    await ws_manager.connect(ws, client_id)
+    await ws_manager.send(client_id, {
+        "event": WSEvent.CONNECTED, "client_id": client_id
+    })
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(ws.receive_text(), timeout=60.0)
+                try:
+                    msg = json.loads(data)
+                    if msg.get("type") == "ping":
+                        await ws_manager.send(client_id, {"type": "pong"})
+                except json.JSONDecodeError:
+                    pass
+            except asyncio.TimeoutError:
+                # Server-side keepalive ping
+                try:
+                    await ws.send_text(json.dumps({"type": "ping"}))
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        ws_manager.disconnect(client_id)
+
+# ── 4. Report endpoint ────────────────────────────────────────
+@app.post("/report")
+async def generate_report(req: dict):
+    question     = req.get("question", "")
+    schema       = req.get("schema", "")
+    client_id    = req.get("client_id", str(uuid.uuid4()))    
+    filters      = req.get("filters", {})
+    print(f"[main] /report received filters: {filters}")
+    force_detail = filters.pop("__force_detail", False)  # ← extract here
+    print(f"[main] force_detail={force_detail}") 
+    if not question or not schema:
+        return {"type": "error", "message": "question and schema required"}
+    return await handle_report(question, schema, client_id, filters, force_detail)
 
 # ── Multi-query generation ────────────────────────────────────
 

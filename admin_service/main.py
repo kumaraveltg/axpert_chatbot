@@ -13,6 +13,9 @@ import tempfile
 import shutil
 import glob
 from admin_service.auth_routes import router as auth_router
+import platform
+from shared.chroma_config import get_chroma, get_existing_collection
+
 
 from shared.database import get_db
 from shared.models import (
@@ -26,20 +29,36 @@ from sync_service.generator import auto_generate_field_instructions
 
 load_dotenv()
 
+ROOT_PATH = os.getenv("ROOT_PATH", "")
+
 app = FastAPI(
     title="Axpert Admin Service",
-    version="1.0.0"
+    version="1.0.0",
+    root_path=ROOT_PATH
 )
+
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX   = platform.system() == "Linux"
+
+if IS_WINDOWS:
+    # Local development
+    ALLOWED_ORIGINS = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+else:
+    # Ubuntu/Linux production
+    ALLOWED_ORIGINS = [
+        "https://axpert.smartaistudio.in",
+        "http://localhost:5173",  # keep for testing on server
+    ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True
+    allow_origins     = ALLOWED_ORIGINS,
+    allow_methods     = ["*"],
+    allow_headers     = ["*"],
+    allow_credentials = False
 )
 
 app.include_router(auth_router)
@@ -713,6 +732,142 @@ async def get_core_transactions(schema_name: str):
     except Exception as e:
         return {"items": [], "error": str(e)}
 
+
+# ══════════════════════════════════════════════════════════════
+# INDUSTRY MASTER
+# ══════════════════════════════════════════════════════════════
+
+class IndustryCreate(BaseModel):
+    industry:    str
+    description: Optional[str] = None
+
+@app.get("/industries")
+async def list_industries():
+    db: Session = next(get_db())
+    items = db.query(IndustryMaster).all()
+    return [
+        {
+            "id":          i.id,
+            "industry":    i.industry,
+            "description": i.description
+        }
+        for i in items
+    ]
+
+@app.post("/industries")
+async def create_industry(req: IndustryCreate):
+    db: Session = next(get_db())
+    exists = db.query(IndustryMaster).filter_by(
+        industry = req.industry
+    ).first()
+    if exists:
+        return {
+            "id":       exists.id,
+            "industry": exists.industry,
+            "message":  "already exists"
+        }
+    item = IndustryMaster(
+        industry    = req.industry,
+        description = req.description,
+        is_active   = 'Y'
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"id": item.id, "industry": item.industry}
+
+@app.delete("/industries/{industry_id}")
+async def delete_industry(industry_id: int):
+    db: Session = next(get_db())
+    item = db.query(IndustryMaster).filter_by(id=industry_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Industry not found")
+    db.delete(item)
+    db.commit()
+    return {"message": f"Deleted industry {industry_id}"}
+
+
+# ══════════════════════════════════════════════════════════════
+# COMPANY REGISTRY
+# ══════════════════════════════════════════════════════════════
+
+class CompanyCreate(BaseModel):
+    company_name: str
+    schema_name:  str
+    industry_id:  int
+    description:  Optional[str] = None
+    contact:      Optional[str] = None
+    logo_url:     Optional[str] = None
+
+@app.get("/companies")
+async def list_companies():
+    db: Session = next(get_db())
+    companies = db.query(CompanyRegistry).filter_by(is_active='Y').all()
+    result = []
+    for c in companies:
+        industry = db.query(IndustryMaster).filter_by(id=c.industry_id).first()
+        result.append({
+            "id":           c.id,
+            "company_name": c.company_name,
+            "schema_name":  c.schema_name,
+            "industry_id":  c.industry_id,
+            "industry":     industry.industry if industry else "",
+            "description":  getattr(c, 'description', None),
+            "contact":      getattr(c, 'contact', None),
+            "logo_url":     getattr(c, 'logo_url', None),
+            "is_active":    c.is_active
+        })
+    return result
+
+@app.post("/companies")
+async def create_company(req: CompanyCreate):
+    db: Session = next(get_db())
+    exists = db.query(CompanyRegistry).filter_by(
+        schema_name = req.schema_name
+    ).first()
+    if exists:
+        raise HTTPException(
+            status_code = 400,
+            detail      = f"Schema {req.schema_name} already registered"
+        )
+    company = CompanyRegistry(
+        company_name = req.company_name,
+        schema_name  = req.schema_name,
+        industry_id  = req.industry_id,
+        is_active    = 'Y'
+    )
+    db.add(company)
+    db.commit()
+    db.refresh(company)
+    return {
+        "id":           company.id,
+        "company_name": company.company_name,
+        "schema_name":  company.schema_name,
+        "industry_id":  company.industry_id
+    }
+
+@app.put("/companies/{company_id}")
+async def update_company(company_id: int, req: CompanyCreate):
+    db: Session = next(get_db())
+    company = db.query(CompanyRegistry).filter_by(id=company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    company.company_name = req.company_name
+    company.schema_name  = req.schema_name
+    company.industry_id  = req.industry_id
+    db.commit()
+    db.refresh(company)
+    return {"id": company.id, "company_name": company.company_name}
+
+@app.delete("/companies/{company_id}")
+async def delete_company(company_id: int):
+    db: Session = next(get_db())
+    company = db.query(CompanyRegistry).filter_by(id=company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    company.is_active = 'N'
+    db.commit()
+    return {"message": f"Deleted company {company_id}"}
 # ══════════════════════════════════════════════════════════════
 # MIGRATION — Local → Cloud
 # ══════════════════════════════════════════════════════════════
@@ -983,3 +1138,83 @@ async def migrate_to_cloud(conn_id: int):
         "status":     "completed" if all_ok else "partial",
         "results":    results
     }
+
+@app.get("/chroma/collections")
+async def chroma_list_collections():
+    """List all ChromaDB collections with chunk counts"""
+    client = get_chroma()
+    cols   = client.list_collections()
+    result = []
+    for c in cols:
+        name = c if isinstance(c, str) else c.name
+        col  = client.get_collection(name)
+        result.append({
+            "name":  name,
+            "count": col.count()
+        })
+    # Sort: shared last, rest alphabetically
+    result.sort(key=lambda x: (x["name"] == "axpert_shared", x["name"]))
+    return {"collections": result}
+
+
+@app.get("/chroma/collections/{name}/chunks")
+async def chroma_get_chunks(name: str, limit: int = 10, offset: int = 0):
+    """Browse chunks in a collection with pagination"""
+    try:
+        col = get_existing_collection(name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+    total   = col.count()
+    results = col.get(
+        limit   = limit,
+        offset  = offset,
+        include = ["documents", "metadatas"]
+    )
+
+    chunks = [
+        {
+            "id":       results["ids"][i],
+            "document": results["documents"][i],
+            "metadata": results["metadatas"][i]
+        }
+        for i in range(len(results["ids"]))
+    ]
+
+    return {
+        "collection": name,
+        "total":      total,
+        "limit":      limit,
+        "offset":     offset,
+        "chunks":     chunks
+    }
+
+
+@app.get("/chroma/collections/{name}/search")
+async def chroma_search(name: str, q: str, limit: int = 10):
+    """Semantic search within a collection"""
+    try:
+        col = get_existing_collection(name)
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Collection '{name}' not found")
+
+    if col.count() == 0:
+        return {"collection": name, "query": q, "results": []}
+
+    results = col.query(
+        query_texts = [q],
+        n_results   = min(limit, col.count()),
+        include     = ["documents", "metadatas", "distances"]
+    )
+
+    chunks = [
+        {
+            "id":       results["ids"][0][i],
+            "document": results["documents"][0][i],
+            "metadata": results["metadatas"][0][i],
+            "distance": results["distances"][0][i]
+        }
+        for i in range(len(results["ids"][0]))
+    ]
+
+    return {"collection": name, "query": q, "results": chunks}

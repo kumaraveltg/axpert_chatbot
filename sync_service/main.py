@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import time
 from datetime import datetime
 import requests as http_requests
+import platform
 from shared.database import (
     get_db,
     init_db,

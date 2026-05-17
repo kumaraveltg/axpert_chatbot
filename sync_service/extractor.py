@@ -217,3 +217,144 @@ def debug_form(schema: str, transid: str):
 
 
     print(f"{'='*50}\n")
+
+def get_runtime_conn(schema: str, host=None, port=None,
+                     db_name=None, username=None, password=None):
+    """
+    Connect to runtime schema (e.g. hcaspay) directly.
+    Unlike get_conn() which points to axdef metadata,
+    this points to actual data schema.
+    """
+    conn = psycopg2.connect(
+        host     = host     or os.getenv("DB_HOST"),
+        port     = port     or os.getenv("DB_PORT"),
+        database = db_name  or os.getenv("DB_NAME"),
+        user     = username or os.getenv("DB_USER"),
+        password = password or os.getenv("DB_PASS")
+    )
+    cur = conn.cursor()
+    cur.execute(f"SET search_path TO {schema}")
+    cur.close()
+    return conn, schema
+
+
+def get_table_columns(schema: str, table: str) -> list:
+    """Get all column names for a runtime table."""
+    try:
+        conn, _ = get_runtime_conn(schema)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s
+            AND table_name = lower(%s)
+            ORDER BY ordinal_position
+        """, (schema, table))
+        cols = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return cols
+    except Exception as e:
+        print(f"[extractor] get_table_columns error: {e}")
+        return []
+
+
+def get_table_max_modified(schema: str, table: str) -> str:
+    try:
+        conn, _ = get_runtime_conn(schema)
+        cur = conn.cursor()
+
+        # Check if modifiedon column exists first
+        cur.execute("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = %s
+            AND table_name = %s
+            AND column_name = 'modifiedon'
+        """, (schema, table))
+
+        if not cur.fetchone():
+            cur.close()
+            conn.close()
+            return None   # ← silently skip, no error
+
+        cur.execute(f"SELECT MAX(modifiedon) FROM {schema}.{table}")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return str(row[0]) if row and row[0] else None
+
+    except Exception:
+        return None
+
+
+def get_metadata_hash(schema: str) -> str:
+    """
+    Hash of all transids+captions in vw_tstructs.
+    Used by change_detector — if hash changes, metadata changed.
+    """
+    import hashlib, json
+    try:
+        conn, meta_schema = get_conn(schema)
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT transid, caption
+            FROM {meta_schema}.vw_tstructs
+            ORDER BY transid
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        content = json.dumps(rows, default=str)
+        return hashlib.md5(content.encode()).hexdigest()
+    except Exception as e:
+        print(f"[extractor] get_metadata_hash error: {e}")
+        return ""
+
+
+def get_all_transids(schema: str) -> list:
+    """
+    All transids from vw_tstructs.
+    Used by report_agent for transid matching.
+    Returns [{"transid": ..., "caption": ...}]
+    """
+    try:
+        conn, meta_schema = get_conn(schema)
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT transid, caption
+            FROM {meta_schema}.vw_tstructs
+            ORDER BY caption
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"transid": r[0], "caption": r[1]} for r in rows]
+    except Exception as e:
+        print(f"[extractor] get_all_transids error: {e}")
+        return []
+
+
+def get_watched_tables(schema: str) -> list:
+    """
+    All runtime tables from vw_dc.
+    Used by change_detector to know which tables to watch.
+    Returns [{"tablename": ..., "transid": ...}]
+    """
+    try:
+        conn, meta_schema = get_conn(schema)
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT DISTINCT tablename, transid
+            FROM {meta_schema}.vw_dc
+            WHERE tablename IS NOT NULL
+            AND tablename != ''
+            AND asgrid = 'TRUE'
+            ORDER BY tablename
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"tablename": r[0].lower(), "transid": r[1]} for r in rows]
+    except Exception as e:
+        print(f"[extractor] get_watched_tables error: {e}")
+        return []
